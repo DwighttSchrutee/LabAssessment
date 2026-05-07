@@ -1,0 +1,20 @@
+# Data files (too large for git)
+data/*.csv
+data/*.csv.gz
+data/*.parquet
+
+# Models (regenerate with notebook)
+models/*.pkl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
