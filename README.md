@@ -23,10 +23,9 @@ periscope_loan_default/
 │   ├── model_comparison.png     ← ROC + metric comparison
 │   └── feature_importance.png   ← Top 20 feature importances
 ├── data/
-│   ├── test_predictions.csv     ← Predictions + features for all
-    ├── accepted_2007_to_2018Q4.csv
-test rows
-│   └── shap_values.csv          ← Per-borrower SHAP values
+│   ├── test_predictions.csv     ← Predictions + features for all test rows (10,000 rows, 38 cols)
+│   ├── accepted_2007_to_2018Q4.csv
+│   └── shap_values.csv          ← Per-borrower SHAP values (10,000 rows, 36 cols)
 └── explanations/
     ├── high_risk_explanations.md ← Part C: 3 plain-English explanations
     └── shap_summary.png          ← SHAP summary beeswarm plot
@@ -53,7 +52,8 @@ pip install -r requirements.txt
 Open and run all cells in `notebooks/loan_default_predictor.ipynb`.
 This will:
 
-- Load and subsample 50,000 rows (fixed seed=42)
+- Load and subsample 50,000 rows from the full 2,260,701-row dataset (fixed seed=42)
+- Filter to resolved loans only (1,366,817 rows before subsampling)
 - Clean features, engineer behavioral features
 - Train both models and evaluate them
 - Generate SHAP explanations
@@ -82,7 +82,7 @@ See `data_audit.md` for the full analysis.
 - `out_prncp`, `total_rec_prncp`, `total_rec_int` — accumulate during repayment
 - `last_fico_range_high/low` — updated FICO, not the score at origination
 
-**Class imbalance:** ~20% default rate. Manageable without resampling; handled via stratified splits and class-weight-aware training.
+**Class imbalance:** 20.9% default rate (10,443 defaults vs 39,557 non-defaults in the 50k subsample). Manageable without resampling; handled via stratified splits. The default rate is preserved in both train (20.9%) and test (20.9%) splits.
 
 ---
 
@@ -96,23 +96,47 @@ Default risk has meaningful non-linear interactions — e.g. a high DTI is dange
 **Why not XGBoost/LightGBM?**
 Gradient Boosting from sklearn is more portable with no extra dependencies, and the dataset (50k rows, <50 features) is small enough that training speed isn't a constraint. LightGBM would be the choice for >500k rows.
 
-### Results
+**Hyperparameters used:** 200 estimators, learning rate 0.05, max depth 4, 80% subsampling, min 20 samples per leaf, random seed 42. These are conservative defaults — no grid search was performed (flagged as a known weakness).
 
-| Metric           | Model 1 (Static) | Model 2 (Static + Behavioral) |
-| ---------------- | ---------------- | ----------------------------- |
-| AUC-ROC          | ~0.71            | ~0.74                         |
-| Precision@Top10% | ~0.43            | ~0.47                         |
-| Recall@Top10%    | ~0.22            | ~0.24                         |
+### Feature Counts
 
-> Exact numbers depend on your subsample draw. Run the notebook to see your results.
+- Model 1 uses **29 static features** (after one-hot encoding `home_ownership` and `purpose`)
+- Model 2 adds **6 behavioral features** for a total of **35 features**
+
+### Results (actual test set numbers, seed=42)
+
+| Metric            | Model 1 (Static) | Model 2 (Static + Behavioral) |
+| ----------------- | ---------------- | ----------------------------- |
+| AUC-ROC           | **0.6961**       | **0.6965**                    |
+| Precision@Top10%  | **0.4490**       | **0.4480**                    |
+| Recall@Top10%     | **0.2149**       | **0.2145**                    |
+| Best F1 threshold | 0.207            | 0.202                         |
+
+**Confusion Matrix @ 0.5 threshold:**
+
+|         | Model 1    | Model 2    |
+| ------- | ---------- | ---------- |
+| TN / FP | 7780 / 131 | 7782 / 129 |
+| FN / TP | 1943 / 146 | 1945 / 144 |
+
+**Confusion Matrix @ best-F1 threshold:**
+
+|         | Model 1 (threshold=0.207) | Model 2 (threshold=0.202) |
+| ------- | ------------------------- | ------------------------- |
+| TN / FP | 4979 / 2932               | 4902 / 3009               |
+| FN / TP | 716 / 1373                | 694 / 1395                |
+
+> Note: At the 0.5 threshold, both models are highly conservative — they flag very few borrowers as defaulters and miss ~93% of actual defaults. The best-F1 threshold (~0.20) is more operationally useful, catching ~66% of defaults at the cost of more false positives.
 
 ### Which model to deploy?
 
-**→ Model 2 (Static + Behavioral).**
+**→ Honest answer: neither model shows a clear winner. Model 2 does not meaningfully outperform Model 1.**
 
-The behavioral features — especially `credit_age_months`, `loan_to_income`, `mths_since_last_delinq_filled`, and `revol_bal_to_limit` — are legitimate at application time (they come from a credit bureau pull, not from post-origination monitoring). They improve AUC by ~3 points and Precision@Top10% by ~4 points, which matters operationally: if a credit officer can only call 10% of borrowers, correctly identifying ~4% more of them is worth the added data dependency.
+The actual results show the behavioral features add almost zero lift over the static model (AUC difference: 0.0004, Precision@Top10% actually drops slightly by 0.001). This is a real finding worth flagging — it means the static application-time features (especially `int_rate`, `grade`, `fico_range_low`) already capture most of the predictable signal in this dataset. The behavioral features are redundant given the strong correlation between `grade`/`int_rate` and the bureau data that drives the behavioral features.
 
-**Caveat:** Model 2 requires `total_rev_hi_lim` and `earliest_cr_line` from a credit bureau. If that feed is unavailable or has missing rate >30%, fall back to Model 1.
+**If forced to choose for deployment**, I would still pick **Model 2** on principle: the behavioral features (`credit_age_months`, `loan_to_income`, `mths_since_last_delinq_filled`, `revol_bal_to_limit`, `pct_tl_nvr_dlq`, `ever_120dpd`) are legitimate at application time and add explainability value even if they don't move the metric significantly on this subsample.
+
+**Caveat:** Model 2 requires `total_rev_hi_lim` and `earliest_cr_line` from a credit bureau. If that feed is unavailable or has missing rate >30%, fall back to Model 1 — which performs just as well.
 
 ---
 
@@ -120,13 +144,23 @@ The behavioral features — especially `credit_age_months`, `loan_to_income`, `m
 
 Three high-risk borrower explanations are in `explanations/high_risk_explanations.md`.
 
-Each explanation follows the format:
+The explanations are generated programmatically: a template-based formatter converts SHAP values into plain English, comparing each borrower's features against portfolio medians from the test set.
 
-- Borrower ID + predicted risk %
-- Top 4 SHAP-driven plain-English risk factors with portfolio comparisons
+**Selected borrowers (from top 5% by predicted risk score):**
+
+| Borrower | LC ID     | Predicted Default Risk |
+| -------- | --------- | ---------------------- |
+| #1       | 70764558  | **76.5%**              |
+| #2       | 137182020 | **53.2%**              |
+| #3       | 88152335  | **50.5%**              |
+
+Each explanation includes:
+
+- Predicted risk %
+- Top 4 SHAP-driven plain-English risk factors with portfolio median comparisons
 - A recommended credit officer action
 
-SHAP (SHapley Additive exPlanations) is used for attribution. For a tree ensemble, `shap.TreeExplainer` is exact (not approximate) and runs in seconds. The values tell us how much each feature pushed the predicted probability up or down from the base rate.
+SHAP (SHapley Additive exPlanations) is used for attribution. For a tree ensemble, `shap.TreeExplainer` is exact (not approximate) and runs in seconds.
 
 ---
 
@@ -149,20 +183,30 @@ The Streamlit app (`app.py`) supports 4 query modes:
 
 2. **Hyperparameter search** — I used reasonable defaults. A proper Optuna / grid search with cross-validation would squeeze another 1-2 AUC points.
 
-3. **Vintage analysis** — Loans issued in 2007–2009 (financial crisis) behave differently. Segmenting by issue year and checking model drift would be essential before production.
+3. **Temporal validation** — I trained on a random subsample rather than training on 2007–2015 and testing on 2016–2018. Temporal splits are more realistic and usually harder. This is a key gap.
 
-4. **Bangladeshi data question** — If deployed on Bangladeshi borrower data instead of US: (a) DTI norms differ significantly, (b) FICO doesn't exist — would need to remap to a local credit score, (c) income verification patterns are different, (d) "home ownership" means something different in a country where land registration is complex. The model would need to be retrained on local data; the features are transferable but the weights are not.
+4. **Better behavioral feature engineering** — the near-zero lift from behavioral features suggests I'm not capturing the right signal. Features like payment-to-income ratio, trend in utilization over time, or delinquency velocity might outperform the static bureau snapshots I used.
 
-5. **Monitoring** — Population Stability Index (PSI) on score distributions + feature distributions month-over-month. Model degrades silently otherwise.
+5. **Vintage analysis** — Loans issued in 2007–2009 (financial crisis) behave differently. Segmenting by issue year and checking model drift would be essential before production.
+
+6. **Bangladeshi data question** — If deployed on Bangladeshi borrower data instead of US: (a) DTI norms differ significantly, (b) FICO doesn't exist — would need to remap to a local credit score, (c) income verification patterns are different, (d) "home ownership" means something different in a country where land registration is complex. The model would need to be retrained on local data; the features are transferable but the weights are not.
+
+7. **Monitoring** — Population Stability Index (PSI) on score distributions + feature distributions month-over-month. Model degrades silently otherwise.
 
 ---
 
 ## Known Weaknesses
 
-- **Precision@Top10% is modest (~47%)** — over half the borrowers flagged in the top decile won't actually default. In a real deployment, this threshold needs to be tuned against the bank's operational capacity (how many calls can the team make?).
-- **No temporal validation** — I trained on a random subsample rather than training on 2007–2015 and testing on 2016–2018. Temporal splits are more realistic and usually harder. I'd flag this as a key gap.
+- **Model 2 adds no measurable lift over Model 1** — AUC difference is 0.0004. The behavioral features I engineered are largely redundant with `int_rate` and `grade`, which already encode bureau information. This is the most important gap to address in a next iteration.
+
+- **AUC of ~0.70 is modest** — the model correctly ranks roughly 70% of defaulter/non-defaulter pairs. In production, this translates to a meaningful but imperfect risk signal. The 0.5 threshold confusion matrix shows the model misses ~93% of actual defaults when trying to stay precise.
+
+- **Precision@Top10% of ~45%** — over half the borrowers flagged in the top decile won't actually default. In a real deployment, this threshold needs to be tuned against the bank's operational capacity (how many calls can the team make?).
+
+- **No temporal validation** — trained on a random subsample rather than a time-based split. Temporal splits are more realistic and usually harder. I'd flag this as a key production gap.
+
 - **Missing data handling is naive** — sentinel value imputation for `mths_since_last_delinq` (999 = "never") is reasonable but not validated. A proper missing-indicator approach would be more rigorous.
 
----
+- **Explanation quality for Borrowers 2 & 3 is weaker** — with predicted risks of 53.2% and 50.5%, these borrowers are only marginally above the base rate. The explanations are technically correct but operationally marginal.
 
-_Periscope Labs AI/ML Take-Home | Built with Python 3.10, scikit-learn, SHAP, Streamlit_
+---
